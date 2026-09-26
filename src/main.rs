@@ -8,6 +8,21 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, SqlitePool};
+use argon2::{
+    Argon2, 
+    password_hash::{
+        PasswordHasher, 
+        PasswordVerifier
+    },
+};
+
+mod banco;
+mod cripto;
+mod estado;
+mod rotas;
+
+
+
 
 const PORT: &str = "3000";
 
@@ -28,7 +43,7 @@ async fn main() {
         "CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user TEXT NOT NULL UNIQUE,
-            password TEXT NOT NULL
+            password_hash TEXT NOT NULL
         )",
     )
     .execute(&db)
@@ -59,23 +74,51 @@ struct Credentials {
 }
 
 
-async fn login(Json(c): Json<Credentials>) -> (StatusCode, Json<Value>) {
-    println!("Tentativa de login: {}", c.user);
+async fn login(
+    State(db): State<SqlitePool>,
+    Json(c): Json<Credentials>,
+) -> (StatusCode, Json<Value>) {
 
-    if c.user == "admin" && c.password == "12345678" {
-        (StatusCode::OK, Json(json!({ "user": c.user })))
+    // coleta o hash que está na primeira linha onde o user é o c.user
+    let row: Option<(String,)> = 
+        sqlx::query_as("SELECT password_hash FROM users WHERE user = ?")
+            .bind(&c.user)
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+
+    let Some((hash,)) = row else {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"erro": "Usuário ou senha incorretos"})));
+    };
+
+    let password = c.password;
+    let ok = tokio::task::spawn_blocking(move || verify_password(&password, &hash))
+        .await
+        .unwrap();
+
+    if ok {
+        (StatusCode::OK, Json(json!({"usuario": c.user})))
     } else {
-        (StatusCode::UNAUTHORIZED, Json(json!({ "erro": "Usuário ou senha incorretos"})))
+        (StatusCode::UNAUTHORIZED, Json(json!({"erro": "Usuário ou senha incorretos"})))
     }
 }
+
 
 async fn register(
     State(db): State<SqlitePool>,
     Json(c): Json<Credentials>,
 ) -> (StatusCode, Json<Value>) {
-    let result = sqlx::query("INSERT INTO users (user, password) VALUES (?, ?)")
+
+    let password = c.password;
+
+    // gera hash da senha em tread separada
+    let hash = tokio::task::spawn_blocking(move || generate_hash(&password))
+        .await
+        .unwrap();
+
+    let result = sqlx::query("INSERT INTO users (user, password_hash) VALUES (?, ?)")
         .bind(&c.user)
-        .bind(&c.password)
+        .bind(&hash)
         .execute(&db)
         .await;
 
@@ -90,4 +133,18 @@ async fn register(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Erro interno" })))
         }
     }
+}
+
+fn generate_hash(password: &str) -> String {
+    Argon2::default()
+        .hash_password(password.as_bytes())
+        .unwrap()
+        .to_string()
+}
+
+
+fn verify_password(password: &str, hash: &str) -> bool {
+    Argon2::default()
+        .verify_password(password.as_bytes(), hash)
+        .is_ok()
 }
